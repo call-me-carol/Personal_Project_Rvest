@@ -1,0 +1,217 @@
+---
+title: "Harvest"
+author: "Carol Hardy"
+date: '2022-07-19'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F)
+
+# General-purpose data wrangling
+    library(tidyverse)  
+# Parsing of HTML/XML files  
+    library(rvest)    
+# String manipulation
+    library(stringr)   
+# Verbose regular expressions
+ #   library(rebus)     
+# Eases DateTime manipulation
+    library(lubridate) 
+library(httr)
+library(curl)
+library(reshape2)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+```
+
+
+## Flour Types
+
+#### First, I scraped all the data from the website "<https://www.nutritionadvance.com/types-of-flour/>."
+
+In reality, all of this data was available to download in .csv form. However, I want to hone in a new skill.
+
+```{r}
+url <- 'https://www.nutritionadvance.com/types-of-flour/'
+webpage <- read_html(url)
+
+#Using CSS selectors to scrape 
+flour_html <- webpage %>% 
+  html_elements('h2')
+
+#Converting the data to text
+flour <- as.data.frame(html_text2(flour_html))
+head(flour)
+
+#Using CSS selectors to scrape 
+nutri_html <- webpage %>% 
+  html_elements('li+ li')
+
+#Converting the data to text
+nutri <- as.data.frame(html_text2(nutri_html))
+head(nutri)
+
+#Using CSS selectors to scrape 
+type_html <- webpage %>% 
+  html_elements('li:nth-child(1)')
+
+#Converting the data to text
+type <- as.data.frame(html_text2(type_html))
+head(type)
+```
+
+#### Data Cleaning
+
+Now comes the difficult part. I am going to clean all the data to make it usable.
+
+```{r}
+names(nutri)[names(nutri) == 'html_text2(nutri_html)'] <- 'nut' # rename variable
+nutri <- nutri %>% slice(- c(1:6, 44:49)) # remove the rows that are not needed
+nutri$nut <- str_remove(nutri$nut[str_detect(nutri$nut, 'Basic nutritional values per 100g:')], 'Basic nutritional values per 100g:') # remove the unnecessary text
+nutri <- separate(nutri, nut, into = c("calorie", "carbs", "fiber", "fat", "protein"), sep = ",") %>%# split variable, there are some missing values now
+  slice(- c(1, 20,29)) #removed rows because I do not want missing data
+
+nutri$calorie <- as.numeric(str_remove(nutri$calorie[str_detect(nutri$calorie, 'calories')], 'calories')) # remove the unnecessary text
+nutri$carbs <- as.numeric(str_remove(nutri$carbs[str_detect(nutri$carbs, 'g carbohydrate')], 'g carbohydrate')) # remove the unnecessary text
+nutri$fiber <- as.numeric(str_remove(nutri$fiber[str_detect(nutri$fiber, 'g fiber')], 'g fiber')) # remove the unnecessary text
+nutri$protein <- str_remove(nutri$protein[str_detect(nutri$protein, 'g protein')], 'g protein') # remove the unnecessary text
+nutri$fat <- as.numeric(str_remove(nutri$fat[str_detect(nutri$fat, 'g fat')], 'g fat')) # remove the unnecessary text
+
+nutri <- nutri %>% separate(protein, into = c(NA,"protein"), "\\s") # split variable to get only protein
+nutri <- nutri %>% mutate(protein = as.numeric(protein))
+head(nutri)
+```
+
+```{r}
+names(flour)[names(flour) == 'html_text2(flour_html)'] <- 'flour_name' # rename variable
+flour <- flour %>% slice(-(38:41)) # remove the rows that are not flour types
+flour <- separate(flour, flour_name, into = c("number", "flour_name"), sep = "^\\S*\\K\\s+") # split variable
+flour <- subset(flour, select = -number ) %>%# remove unnecessary column
+  slice(- c(1, 20,29)) %>% #removed rows because I do not want missing data
+  mutate(flour_name = as.factor(flour_name))
+head(flour)
+```
+
+```{r}
+names(type)[names(type) == 'html_text2(type_html)'] <- 'type' # rename variable
+type <- type %>% slice(-c(1:2, 40:41))
+type$type <- str_remove(type$type[str_detect(type$type, 'Type of flour:')], 'Type of flour:') # remove the unnecessary text
+type <- type %>% mutate(type = as.factor(type)) %>%
+  slice(- c(1, 20,29))
+```
+
+```{r}
+#put it all together
+flour <- bind_cols(flour, type, nutri)
+head(flour)
+```
+
+#### Data Exploration
+
+```{r}
+table(flour$type)
+levels(flour$type)
+```
+
+Here we can see that the data is quite unbalanced. There is only one type of flour that is made of insects (cricket flour). I will probably need to remove this in order to perform the training and testing for the random forest. I also will combine the seed type flour (sunflower) with the nut type flower. I think those categories are similar enough that it makes sense.
+
+```{r}
+levels(flour$type) <- c("insect", "legume", "nut", "refined grain", "root/tuber", "nut", "whole grain") # change the names to combine seed w/ nut and remove the whitespace in front of the level name
+levels(flour$type)
+table(flour$type)
+```
+
+#### Data Viz
+
+In Appendix B of ROS (Regression and Other Stories) the authors encourage making many graphs, but they do not want to see the irrelevant graphs. So I am going to try to do that. They also encourage graphing the fitted model.
+
+```{r, fig.cap= "There seems to be some distinctive binning between the different flour types. So I think the random forest algorithm will be able to parse the various flour types. For example, the root/tuber flours are high in carbs, but very low in protein."}
+
+#put data into long format
+flour_long <- flour %>% 
+  select("type", "carbs", "fiber", "fat","protein") %>%
+  pivot_longer(-type, names_to = "nutrition", values_to ="grams")
+
+flour_long %>% ggplot(aes(x = nutrition, y = grams, color = type)) + # make plot
+  geom_jitter(size = 2, shape = 17, width = .05, height = .5) +
+  theme_minimal() + 
+  ggtitle("Nutritional Profiles of Different Flour Types", subtitle = "Legumes and nuts have a lot of protein, fiber, and fat")
+```
+
+### Random Forest
+
+There is not enough data for how many type of flour there are so I am going to combine types into four categories. There will be a legume/nut/insect category.
+
+```{r}
+levels(flour$type) <- c("legume/nut/insect", "legume/nut/insect", "legume/nut/insect", "refined grain", "root/tuber", "whole grain") # change the names to combine
+levels(flour$type)
+table(flour$type)
+```
+
+Before going to the random forest, I want to visualize a single decision tree using the entire dataset.
+
+```{r}
+tree <- rpart(type ~ calorie + carbs + fiber + fat + protein , data = flour, method = 'class')
+rpart.plot(tree)
+```
+
+**How to read a single tree:**
+
+-   The top line of each node shows the type of flour being predicted. So in the first node it makes sense that the algorithm would predict whole grain wheat because that is the type of flour that occurs most often in the data set.
+-   The second line in each node is the predicted probability of each type (order: legume/nut/insect, refined grain, root/tuber, whole grain). So the final node labeled 'refined grain' has a 50% chance of being in the root/tuber category.
+-   The bottom line of each node shows the percentage of observations in the node. For example 50% of the flours are predicted to be whole grain in the final nodes (bottom line).
+-   We can see that root/tuber flour types are never predicted because the category is marked as unused in the legend.
+
+```{r, fig.cap= "The algorithm is not able to tell the difference between refined grain and root/tuber flour based off the predictors in the data (Maybe we would need to add taste to the data?). Here is a plot of only those two types of flour. The single tree was using fat and carbs to classify the type of flour. When looking at this plot, both types of flour look very similar in terms of carbs and fat. "}
+
+#put data into long format
+flour_long <- flour %>% 
+  select("type", "carbs", "fiber", "fat", "protein") %>%
+  pivot_longer(-type, names_to = "nutrition", values_to ="grams") %>%
+  filter(type  %in% c("root/tuber", "refined grain"))
+
+flour_long %>% ggplot(aes(x = nutrition, y = grams, color = type)) + # make plot
+  geom_jitter(size = 2, shape = 17, width = .05, height = .5) +
+  theme_minimal() + 
+  ggtitle("Nutritional Profiles of Different Flour Types")
+```
+
+In contrast to a single decision tree, the random forest is an ensemble of these trees. Random forests are non-linear meaning they will account for interactions. First we will split the data into training and testing data sets. In looking at Leo Breiman and Adele Cutler's website on random forests (<https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm#ooberr>), the algorithm will internally use a leave on out method of analysis.
+
+```{r}
+set.seed(20221907)
+f <- sample(2, nrow(flour), replace = TRUE, prob = c(0.8, 0.2))
+train <- flour[f==1,]
+test <- flour[f==2,]
+```
+
+The random forest below is fitting 200 different decision trees because this minimized the oob.
+
+The out-of-bag (oob) error estimate is 17.65%. This means one third of the possible sampled trees are initially left out of the construction of the the $k^{th}$ tree. Then the samples are run down the $k^{th}$ tree, the incorrectly identified classes is the oob error estimate.The oob equals the number of flour types that were misclassified divided by the total number of observations in the data set ($\frac{5}{34}$).
+
+```{r}
+rf <- randomForest(type ~ calorie + carbs + fiber + fat + protein , data = flour, ntree = 200, importance = T)
+print(rf)
+```
+
+A look at **variable importance:**
+
+-   The values on the x-axis are all of relative, not absolute, importance.
+-   The mean decrease accuracy is an estimate of how much model performance is lost when a predictor is removed.
+-   The mean decrease gini is a relative measure of how often a node was split based on a particular variable.
+
+```{r}
+varImpPlot(rf)
+```
+
+Note: I saved the .csv used for the analysis as: "write.csv(flour, 'C:\\Users\\enilo\\Dropbox\\506\\Personal_Proj\\flour_data.csv')." However, all the code used to make the dataset is in the file and (should be) reproducible.
+
+Resources Used: 
+
+- https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm#giniimp
+- https://www.blopig.com/blog/2017/04/a-very-basic-introduction-to-random-forests-using-r/
+- https://www.nutritionadvance.com/types-of-flour/
+- https://www.analyticsvidhya.com/blog/2017/03/beginners-guide-on-web-scraping-in-r-using-rvest-with-hands-on-knowledge/
+- https://avehtari.github.io/ROS-Examples/examples.html
